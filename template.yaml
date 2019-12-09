@@ -1,0 +1,194 @@
+# Copyright 2019 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+---
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Resource template for integrating SonarQube with AWS CodeCommit approval workflow'
+
+Parameters:
+  CodeCommitRepositoryName:
+    Type: String
+    Default: PullRequestApproverBlogDemo
+  CodeCommitRepositoryDescription:
+    Type: String
+    Default: 'A Maven Java project with a SonarQube analysis integration'
+  SonarQubeUserName:
+    Type: String
+    Description: 'Username of SonarQube identity'
+    MinLength: 3
+    NoEcho: true
+  SonarQubePassword:
+    Type: String
+    Description: 'Password for SonarQube user identity'
+    MinLength: 8
+    NoEcho: true
+
+Resources:
+  CodeCommitRepository:
+    Type: AWS::CodeCommit::Repository
+    Properties:
+      RepositoryName: !Ref CodeCommitRepositoryName
+      RepositoryDescription: !Ref CodeCommitRepositoryDescription
+      Code:
+        S3:
+          Bucket: codecommit-sonarqube-integration-blog-dec-2019
+          Key: PullRequestApproverBlogDemo.zip
+
+  CodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Artifacts:
+        Type: NO_ARTIFACTS
+      BadgeEnabled: true
+      Description: !Sub 'SonarQube analysis for repository ${CodeCommitRepositoryName}'
+      Environment: 
+        ComputeType: BUILD_GENERAL1_MEDIUM
+        Type: LINUX_CONTAINER
+        Image: 'aws/codebuild/standard:2.0'
+        EnvironmentVariables:
+          - Name: SONARQUBE_USER_CREDENTIAL_SECRET
+            Value: !Ref SonarQubeUserSecret
+      QueuedTimeoutInMinutes: 10
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Source: 
+        Type: CODECOMMIT
+        Location: !GetAtt CodeCommitRepository.CloneUrlHttp
+      TimeoutInMinutes: 10
+
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Action: 
+            - sts:AssumeRole
+          Effect: Allow
+          Principal:
+            Service: 
+              - codebuild.amazonaws.com
+      Path: /
+      Policies:
+        - PolicyName: CodeBuildAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Action:
+                - logs:*
+                - codecommit:PostCommentForPullRequest
+                - codecommit:UpdatePullRequestApprovalState
+                Effect: Allow
+                Resource: '*'
+              - Action:
+                - codecommit:GitPull
+                Effect: Allow
+                Resource: !GetAtt CodeCommitRepository.Arn
+              - Action:
+                - secretsmanager:GetSecretValue
+                Effect: Allow
+                Resource: !Ref SonarQubeUserSecret
+
+  PullRequestTriggerCodeBuildRule:
+    Type: AWS::Events::Rule
+    Properties: 
+      Description: 'Rule to trigger build from CodeCommit pull request'
+      EventPattern:
+        source:
+          - aws.codecommit
+        detail-type:
+          - 'CodeCommit Pull Request State Change'
+        detail:
+          event:
+            - pullRequestCreated
+            - pullRequestSourceBranchUpdated
+        resources:
+          - !GetAtt CodeCommitRepository.Arn
+      State: ENABLED
+      Targets: 
+        - Arn: !GetAtt CodeBuildProject.Arn
+          Id: codebuild
+          RoleArn: !GetAtt CloudWatchEventsCodeBuildRole.Arn
+          InputTransformer:
+            InputTemplate: |
+              {
+                "sourceVersion": <sourceVersion>,
+                "artifactsOverride": {"type": "NO_ARTIFACTS"},
+                "environmentVariablesOverride": [
+                   {
+                       "name": "PULL_REQUEST_ID",
+                       "value": <pullRequestId>,
+                       "type": "PLAINTEXT"
+                   },
+                   {
+                       "name": "REPOSITORY_NAME",
+                       "value": <repositoryName>,
+                       "type": "PLAINTEXT"
+                   },
+                   {
+                       "name": "SOURCE_COMMIT",
+                       "value": <sourceCommit>,
+                       "type": "PLAINTEXT"
+                   },
+                   {
+                       "name": "DESTINATION_COMMIT",
+                       "value": <destinationCommit>,
+                       "type": "PLAINTEXT"
+                   },
+                   {
+                      "name" : "REVISION_ID",
+                      "value": <revisionId>,
+                      "type": "PLAINTEXT"
+                   }
+                ]
+              }
+            InputPathsMap:
+              sourceVersion: "$.detail.sourceCommit"
+              pullRequestId: "$.detail.pullRequestId"
+              repositoryName: "$.detail.repositoryNames[0]"
+              sourceCommit: "$.detail.sourceCommit"
+              destinationCommit: "$.detail.destinationCommit"
+              revisionId: "$.detail.revisionId"
+
+  CloudWatchEventsCodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - events.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: events-invoke-codebuild
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Resource: !GetAtt CodeBuildProject.Arn
+                Action: 
+                  - codebuild:StartBuild
+
+  SonarQubeUserSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: 'SonarQube user credentials'
+      SecretString: !Sub '{"username":"${SonarQubeUserName}","password":"${SonarQubePassword}"}'
+
+  SonarQubeUserSecretResourcePolicy:
+    Type: AWS::SecretsManager::ResourcePolicy
+    Properties: 
+      SecretId: !Ref SonarQubeUserSecret
+      ResourcePolicy: 
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !GetAtt CodeBuildRole.Arn
+            Action:
+              - secretsmanager:GetSecretValue
+            Resource: '*'
+            Condition:
+              'ForAnyValue:StringEquals':
+                'secretsmanager:VersionStage': AWSCURRENT
